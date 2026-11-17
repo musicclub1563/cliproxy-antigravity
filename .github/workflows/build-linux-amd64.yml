@@ -1,10 +1,11 @@
 name: Build linux-amd64 plugin
 
-# Builds the CLIProxyAPI native plugin (c-shared) for linux/amd64 only and publishes it as a
+# Builds the CLIProxyAPI native plugin (c-shared) for linux/amd64 and publishes it as a
 # downloadable artifact. No release is created and no production credentials are used.
 #
-# The job runs inside golang:1.23-bullseye so the shared library is linked against glibc 2.31,
-# which keeps it loadable on Debian 11/12 and other distributions older than Ubuntu 24.04.
+# The artifact is built inside golang:1.23-bullseye so the shared library is linked against
+# glibc 2.31, which keeps it loadable on Debian 11/12 and other distributions that still ship
+# an older glibc than the rotating ubuntu-latest runner image.
 
 on:
   workflow_dispatch:
@@ -17,25 +18,19 @@ permissions:
 
 env:
   PLUGIN_ID: cliproxy-antigravity
+  GO_VERSION: "1.23.x"
 
 jobs:
-  build:
-    name: linux/amd64
+  test:
+    name: Tests and ABI smoke test
     runs-on: ubuntu-latest
-    container: golang:1.23-bullseye
     steps:
-      - name: Install build prerequisites
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates python3 binutils
-
       - uses: actions/checkout@v4
 
-      - name: Show toolchain
-        run: |
-          go version
-          gcc --version | head -n1
-          ldd --version | head -n1
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: false
 
       - name: Format check
         run: test -z "$(gofmt -l *.go scripts/*.go)"
@@ -43,7 +38,7 @@ jobs:
       - name: Unit tests
         run: CGO_ENABLED=1 go test ./...
 
-      - name: Build plugin
+      - name: Build plugin for the ABI smoke test
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -54,6 +49,34 @@ jobs:
 
       - name: ABI smoke test
         run: python3 scripts/abi_smoke.py "dist/${PLUGIN_ID}.so"
+
+  build:
+    name: linux/amd64 (glibc 2.31 baseline)
+    needs: test
+    runs-on: ubuntu-latest
+    container: golang:1.23-bullseye
+    steps:
+      - name: Check container toolchain
+        run: |
+          set -eu
+          if ! command -v git >/dev/null 2>&1; then
+            apt-get update && apt-get install -y --no-install-recommends git ca-certificates
+          fi
+          go version
+          gcc --version | head -n1
+          ldd --version | head -n1
+          command -v objdump nm sha256sum grep cut stat
+
+      - uses: actions/checkout@v4
+
+      - name: Build plugin
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOAMD64=v1 CGO_CFLAGS="-march=x86-64" \
+            go build -trimpath -buildmode=c-shared -ldflags "-s -w" \
+            -o "dist/${PLUGIN_ID}.so" .
+          rm -f dist/*.h
 
       - name: Package artifact
         run: |
@@ -82,9 +105,8 @@ jobs:
             printf '1. Stop CLIProxyAPI.\n'
             printf '2. Back up the current library: `cp plugins/%s.so plugins/%s.so.bak-$(date +%%Y%%m%%d%%H%%M)`\n' "${PLUGIN_ID}" "${PLUGIN_ID}"
             printf '3. Copy this file to `plugins/%s.so` and make it readable: `chmod 755 plugins/%s.so`\n' "${PLUGIN_ID}" "${PLUGIN_ID}"
-            printf '4. Start CLIProxyAPI and confirm the plugin loaded with the new version in the log:\n'
-            printf '   `pluginhost: plugin registered plugin_id=%s version=<expected>`\n' "${PLUGIN_ID}"
-            printf '5. Check the catalog. Dynamic models must be back:\n'
+            printf '4. Start CLIProxyAPI and confirm the plugin registered with the new version in the log.\n'
+            printf '5. Check the catalog; the dynamically discovered models must be back:\n'
             printf '   `curl -s http://127.0.0.1:8317/v1/models -H "Authorization: Bearer <api-key>" | grep -o "agy/[a-z0-9.-]*" | sort -u`\n'
             printf '   Expected entries include `agy/gemini-3.8-flash-high`, `agy/claude-sonnet-4-6`, `agy/gpt-oss-120b-medium`.\n\n'
             printf '## Verify\n\n'
@@ -117,10 +139,11 @@ jobs:
             echo "| field | value |"
             echo "| --- | --- |"
             echo "| artifact | \`${ARTIFACT}\` |"
+            echo "| plugin version | \`${PLUGIN_VERSION}\` |"
             echo "| commit | \`${GITHUB_SHA}\` |"
             echo "| glibc baseline | \`${GLIBC_REQ}\` |"
             echo "| sha256 | \`${CHECKSUM}\` |"
             echo
             echo "Download the artifact from this run, then follow \`INSTALL.md\` inside it."
-            echo "This job only proves the build, unit tests and ABI smoke test; it does not validate a live server."
+            echo "This job proves the build, unit tests and ABI smoke test only; it does not validate a live server."
           } >> "$GITHUB_STEP_SUMMARY"
