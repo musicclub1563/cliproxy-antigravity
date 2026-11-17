@@ -55,6 +55,10 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     container: golang:1.23-bullseye
+    # The container default shell is dash, which has no `pipefail`.
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Check container toolchain
         run: |
