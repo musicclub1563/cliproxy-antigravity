@@ -98,25 +98,6 @@ func (r *processRegistry) killAll() {
 	}
 }
 
-type catalogState struct {
-	sync.Mutex
-	fetchedAt  time.Time
-	binaryPath string
-	models     []modelInfo
-	nativeByID map[string]string
-}
-
-var modelCatalog = catalogState{}
-
-func invalidateModels() {
-	modelCatalog.Lock()
-	modelCatalog.fetchedAt = time.Time{}
-	modelCatalog.binaryPath = ""
-	modelCatalog.models = nil
-	modelCatalog.nativeByID = nil
-	modelCatalog.Unlock()
-}
-
 func standardBuiltinModels() []modelInfo {
 	return []modelInfo{
 		{
@@ -170,77 +151,6 @@ func standardBuiltinModels() []modelInfo {
 			UserDefined:                true,
 		},
 	}
-}
-
-func discoverModels(cfg pluginConfig) []modelInfo {
-	modelCatalog.Lock()
-	defer modelCatalog.Unlock()
-
-	if modelCatalog.binaryPath == cfg.BinaryPath && time.Since(modelCatalog.fetchedAt) < time.Minute && len(modelCatalog.models) > 0 {
-		return cloneModels(modelCatalog.models)
-	}
-
-	builtin := standardBuiltinModels()
-	models := append([]modelInfo(nil), builtin...)
-	nativeByID := map[string]string{
-		"agy/default":                     "",
-		"antigravity/default":             "",
-		"default":                         "",
-		"Antigravity CLI (default model)": "",
-		"gemini-3.8-flash":                "gemini-3.8-flash",
-		"Gemini 3.8 Flash":                "gemini-3.8-flash",
-		"gemini-3.8-flash-high":           "gemini-3.8-flash-high",
-		"Gemini 3.8 Flash (High)":         "gemini-3.8-flash-high",
-		"gemini-3.8-flash-medium":         "gemini-3.8-flash-medium",
-		"Gemini 3.8 Flash (Medium)":       "gemini-3.8-flash-medium",
-		"gemini-3.8-flash-low":            "gemini-3.8-flash-low",
-		"Gemini 3.8 Flash (Low)":          "gemini-3.8-flash-low",
-	}
-
-	if err := validateBinaryPath(cfg.BinaryPath); err == nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-		defer cancel()
-		binPath := resolveBinaryPath(cfg.BinaryPath)
-		cmd := exec.CommandContext(ctx, binPath, "models")
-		configureSysProcAttr(cmd)
-		var stdout, stderr bytes.Buffer
-		cmd.Stdout = &stdout
-		cmd.Stderr = &stderr
-		if cfg.Workdir != "" {
-			cmd.Dir = cfg.Workdir
-		}
-
-		if err := cmd.Start(); err == nil {
-			activeProcesses.add(cmd)
-			_ = cmd.Wait()
-			activeProcesses.remove(cmd)
-			discovered, mapping := parseAgyModelLines(stdout.String())
-			for _, m := range discovered {
-				models = append(models, m)
-			}
-			for id, native := range mapping {
-				nativeByID[id] = native
-				// Also map unprefixed and antigravity/ prefixes
-				slug := strings.TrimPrefix(id, "agy/")
-				nativeByID[slug] = native
-				nativeByID["antigravity/"+slug] = native
-
-				baseSlug := stripEffortSuffix(slug)
-				if baseSlug != slug {
-					baseNative := stripEffortSuffix(native)
-					nativeByID[baseSlug] = baseNative
-					nativeByID["agy/"+baseSlug] = baseNative
-					nativeByID["antigravity/"+baseSlug] = baseNative
-				}
-			}
-		}
-	}
-
-	modelCatalog.fetchedAt = time.Now()
-	modelCatalog.binaryPath = cfg.BinaryPath
-	modelCatalog.models = models
-	modelCatalog.nativeByID = nativeByID
-	return cloneModels(models)
 }
 
 // routeModel sends requests for agy models straight to this plugin's executor. agy manages its

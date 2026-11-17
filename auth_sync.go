@@ -159,10 +159,18 @@ func setAuthDir(dir string) {
 
 // rememberAuthDir records the auth-dir the host reports with auth requests. It is authoritative,
 // unlike the guess made from the plugin's own config section at registration.
+// A different directory means a different set of accounts, so the model catalog is dropped and
+// rebuilt from the accounts that directory actually describes.
 func rememberAuthDir(dir string) {
-	if dir = strings.TrimSpace(dir); dir != "" {
-		setAuthDir(dir)
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return
 	}
+	if currentAuthDir() == dir {
+		return
+	}
+	setAuthDir(dir)
+	invalidateModels()
 }
 
 func currentAuthDir() string {

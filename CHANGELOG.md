@@ -4,6 +4,12 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Fixed
+
+- Dynamic model discovery ran `agy models` with the CLIProxyAPI process environment, so a service account without its own `agy` login answered "Please sign in to view available models" and the catalog stayed at the built-in Gemini entries. Discovery now runs once per enabled, signed-in account home (from the `agy` auth files and `accounts_dir`), with `HOME`/`USERPROFILE` set only on the child process, and merges the results with de-duplication. Anthropic and GPT-OSS models are back in the list on multi-account installs.
+- The discovery cache was keyed by binary path only, so one account's model list could be reused for another; it is now keyed by binary, workdir, the account set and each account's token mtime, and a new `auth-dir` drops it.
+- Discovery ignored the subprocess exit status and parsed stdout unconditionally; only a successful run is parsed now, and failures keep the built-in fallback and log a sanitized diagnostic once per change.
+
 ## [0.3.1] - 2026-11-16
 
 ### Fixed
