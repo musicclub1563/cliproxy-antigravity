@@ -92,8 +92,9 @@ jobs:
             golang:1.23-bullseye \
             bash -c 'set -euo pipefail
               go version
-              gcc --version | head -n1
-              ldd --version | head -n1
+              # sed reads the whole stream, so pipefail never trips on SIGPIPE the way head does.
+              gcc --version | sed -n "1p"
+              ldd --version | sed -n "1p"
               go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags "-s -w" \
                 -o "dist/${PLUGIN_ID}.so" .
               rm -f dist/*.h
