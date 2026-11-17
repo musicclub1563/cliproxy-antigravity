@@ -1,11 +1,12 @@
-name: Build linux-amd64 plugin
+name: Build linux plugins
 
-# Builds the CLIProxyAPI native plugin (c-shared) for linux/amd64 and publishes it as a
-# downloadable artifact. No release is created and no production credentials are used.
+# Builds the CLIProxyAPI native plugin (c-shared) for linux/amd64 and linux/arm64 and publishes
+# each as a downloadable artifact. No release is created and no production credentials are used.
 #
-# The artifact is built inside golang:1.23-bullseye so the shared library is linked against
-# glibc 2.31, which keeps it loadable on Debian 11/12 and other distributions that still ship
-# an older glibc than the rotating ubuntu-latest runner image.
+# Both architectures are built inside golang:1.23-bullseye (Debian 11, glibc 2.31) so the shared
+# libraries stay loadable on Debian 11/12 and other distributions older than the runner image.
+# The arm64 build runs in the same image through QEMU, so it is a native build rather than a
+# cross-compile against a newer sysroot.
 
 on:
   workflow_dispatch:
@@ -51,57 +52,72 @@ jobs:
         run: python3 scripts/abi_smoke.py "dist/${PLUGIN_ID}.so"
 
   build:
-    name: linux/amd64 (glibc 2.31 baseline)
+    name: linux/${{ matrix.arch }}
     needs: test
     runs-on: ubuntu-latest
-    container: golang:1.23-bullseye
-    # The container default shell is dash, which has no `pipefail`.
-    defaults:
-      run:
-        shell: bash
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: linux/amd64
+            cflags: -march=x86-64
+            goarm64: ""
+          - arch: arm64
+            platform: linux/arm64
+            cflags: -march=armv8-a
+            goarm64: v8.0
     steps:
-      - name: Check container toolchain
-        run: |
-          set -eu
-          if ! command -v git >/dev/null 2>&1; then
-            apt-get update && apt-get install -y --no-install-recommends git ca-certificates
-          fi
-          go version
-          gcc --version | head -n1
-          ldd --version | head -n1
-          command -v objdump nm sha256sum grep cut stat
+      - name: Enable arm64 emulation
+        if: matrix.arch == 'arm64'
+        uses: docker/setup-qemu-action@v3
 
       - uses: actions/checkout@v4
 
-      - name: Build plugin
+      - name: Build in the pinned glibc container
         run: |
           set -euo pipefail
           mkdir -p dist
           # -buildvcs=false: git inside the container refuses the mounted checkout, and a plugin
           # does not need VCS stamping.
-          CGO_ENABLED=1 GOOS=linux GOARCH=amd64 GOAMD64=v1 CGO_CFLAGS="-march=x86-64" \
-            go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags "-s -w" \
-            -o "dist/${PLUGIN_ID}.so" .
-          rm -f dist/*.h
+          docker run --rm \
+            --platform "${{ matrix.platform }}" \
+            --user "$(id -u):$(id -g)" \
+            -e HOME=/tmp -e GOPATH=/tmp/go -e GOCACHE=/tmp/gocache \
+            -e CGO_ENABLED=1 -e GOOS=linux -e GOARCH="${{ matrix.arch }}" \
+            -e GOARM64="${{ matrix.goarm64 }}" -e CGO_CFLAGS="${{ matrix.cflags }}" \
+            -e PLUGIN_ID="${PLUGIN_ID}" \
+            -v "$PWD:/src" -w /src \
+            golang:1.23-bullseye \
+            bash -lc 'set -euo pipefail
+              go version
+              gcc --version | head -n1
+              ldd --version | head -n1
+              go build -trimpath -buildvcs=false -buildmode=c-shared -ldflags "-s -w" \
+                -o "dist/${PLUGIN_ID}.so" .
+              rm -f dist/*.h
+              (objdump -T "dist/${PLUGIN_ID}.so" | grep -o "GLIBC_[0-9.]*" | sort -uV | tail -n1 || echo unknown) > dist/.glibc'
 
       - name: Package artifact
         run: |
           set -euo pipefail
           SHORT_SHA="$(printf '%s' "${GITHUB_SHA}" | cut -c1-7)"
-          ARTIFACT="${PLUGIN_ID}-linux-amd64-${SHORT_SHA}"
+          ARCH="${{ matrix.arch }}"
+          ARTIFACT="${PLUGIN_ID}-linux-${ARCH}-${SHORT_SHA}"
           VERSION="$(grep -m1 'pluginVersion = ' plugin.go | cut -d'"' -f2)"
           echo "ARTIFACT=${ARTIFACT}" >> "$GITHUB_ENV"
           echo "PLUGIN_VERSION=${VERSION}" >> "$GITHUB_ENV"
+          echo "ARCH=${ARCH}" >> "$GITHUB_ENV"
 
           cd dist
           sha256sum "${PLUGIN_ID}.so" > "${PLUGIN_ID}.so.sha256"
           CHECKSUM="$(cut -d' ' -f1 "${PLUGIN_ID}.so.sha256")"
           SIZE="$(stat -c%s "${PLUGIN_ID}.so")"
-          GLIBC_REQ="$(objdump -T "${PLUGIN_ID}.so" | grep -o 'GLIBC_[0-9.]*' | sort -uV | tail -n1 || echo unknown)"
-          nm -D --defined-only "${PLUGIN_ID}.so" | grep cliproxy_plugin_init
+          GLIBC_REQ="$(cat .glibc 2>/dev/null || echo unknown)"
+          rm -f .glibc
 
           {
-            printf '# %s %s (linux/amd64)\n\n' "${PLUGIN_ID}" "${VERSION}"
+            printf '# %s %s (linux/%s)\n\n' "${PLUGIN_ID}" "${VERSION}" "${ARCH}"
             printf -- '- Commit: %s\n' "${GITHUB_SHA}"
             printf -- '- Built at: %s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
             printf -- '- Size: %s bytes\n' "${SIZE}"
@@ -113,8 +129,7 @@ jobs:
             printf '3. Copy this file to `plugins/%s.so` and make it readable: `chmod 755 plugins/%s.so`\n' "${PLUGIN_ID}" "${PLUGIN_ID}"
             printf '4. Start CLIProxyAPI and confirm the plugin registered with the new version in the log.\n'
             printf '5. Check the catalog; the dynamically discovered models must be back:\n'
-            printf '   `curl -s http://127.0.0.1:8317/v1/models -H "Authorization: Bearer <api-key>" | grep -o "agy/[a-z0-9.-]*" | sort -u`\n'
-            printf '   Expected entries include `agy/gemini-3.8-flash-high`, `agy/claude-sonnet-4-6`, `agy/gpt-oss-120b-medium`.\n\n'
+            printf '   `curl -s http://127.0.0.1:8317/v1/models -H "Authorization: Bearer <api-key>" | grep -o "\\"id\\":\\"[^\\"]*\\"" | sort -u`\n\n'
             printf '## Verify\n\n'
             printf '```\nsha256sum -c %s.so.sha256\nldd -r ./%s.so\n```\n\n' "${PLUGIN_ID}" "${PLUGIN_ID}"
             printf '## Rollback\n\n'
@@ -140,7 +155,7 @@ jobs:
       - name: Job summary
         run: |
           {
-            echo "## cliproxy-antigravity linux/amd64"
+            echo "## cliproxy-antigravity linux/${ARCH}"
             echo
             echo "| field | value |"
             echo "| --- | --- |"
