@@ -84,12 +84,13 @@ jobs:
             --platform "${{ matrix.platform }}" \
             --user "$(id -u):$(id -g)" \
             -e HOME=/tmp -e GOPATH=/tmp/go -e GOCACHE=/tmp/gocache \
+            -e PATH=/usr/local/go/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
             -e CGO_ENABLED=1 -e GOOS=linux -e GOARCH="${{ matrix.arch }}" \
             -e GOARM64="${{ matrix.goarm64 }}" -e CGO_CFLAGS="${{ matrix.cflags }}" \
             -e PLUGIN_ID="${PLUGIN_ID}" \
             -v "$PWD:/src" -w /src \
             golang:1.23-bullseye \
-            bash -lc 'set -euo pipefail
+            bash -c 'set -euo pipefail
               go version
               gcc --version | head -n1
               ldd --version | head -n1
