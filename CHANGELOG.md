@@ -4,6 +4,13 @@ All notable changes to this project will be documented here.
 
 ## [Unreleased]
 
+### Changed
+
+- The published catalog is now exactly what `agy models` reports for the signed-in accounts, one entry per model. The built-in Gemini list, the `agy/default` entry and the synthesized effort-less variants (`gemini-3.8-flash`, `gpt-oss-120b`, ...) are no longer mixed in after a successful discovery, so no per-account `excluded_models` rules are needed to clean the list.
+- Model IDs are published without the `agy/` prefix, because CLIProxyAPI's model list only carries `id`/`object`/`created`/`owned_by`, so clients derive the visible name from the ID. `agy/...`, `antigravity/...`, the humanized labels and the effort-less base names stay valid request aliases; they are resolution-only and never published.
+- A bare model name is only claimed when no configured native provider serves that family (claude/anthropic, gemini/antigravity/vertex, codex/openai), so an existing provider keeps its own routing. The explicit `agy/` prefix still wins.
+- An empty but successful discovery publishes an empty list instead of the built-in fallback; the fallback is now used only when every account query fails.
+
 ### Fixed
 
 - Dynamic model discovery ran `agy models` with the CLIProxyAPI process environment, so a service account without its own `agy` login answered "Please sign in to view available models" and the catalog stayed at the built-in Gemini entries. Discovery now runs once per enabled, signed-in account home (from the `agy` auth files and `accounts_dir`), with `HOME`/`USERPROFILE` set only on the child process, and merges the results with de-duplication. Anthropic and GPT-OSS models are back in the list on multi-account installs.

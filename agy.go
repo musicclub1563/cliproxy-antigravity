@@ -9,7 +9,6 @@ import (
 	"fmt"
 	"net/http"
 	"os/exec"
-	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -156,43 +155,64 @@ func standardBuiltinModels() []modelInfo {
 // routeModel sends requests for agy models straight to this plugin's executor. agy manages its
 // own login, so there is no CLIProxyAPI auth record for the host's credential scheduler to pick.
 // When an agy auth record does exist, the normal auth path is left in charge.
+//
+// The catalog publishes bare native model IDs, so a bare name is only claimed when no
+// configured native provider serves the same family: an existing Claude/Gemini/Codex setup keeps
+// its own routing. The agy/ and antigravity/ prefixes stay explicit and always win.
 func routeModel(req modelRouteRequest) modelRouteResponse {
 	if containsFold(req.AvailableProviders, providerID) {
 		return modelRouteResponse{}
 	}
-	model := strings.TrimSpace(req.RequestedModel)
+	model := requestModelBaseName(req.RequestedModel)
+	lower := strings.ToLower(model)
+	switch {
+	case strings.HasPrefix(lower, "agy/"):
+		return modelRouteResponse{Handled: true, TargetKind: "self", Reason: agyRouteReason}
+	case strings.HasPrefix(lower, "antigravity/"):
+		// antigravity/ is only claimed when the built-in Antigravity provider is not configured.
+		if containsFold(req.AvailableProviders, "antigravity") {
+			return modelRouteResponse{}
+		}
+		return modelRouteResponse{Handled: true, TargetKind: "self", Reason: agyRouteReason}
+	}
+	if nativeProviderOwnsModel(model, req.AvailableProviders) {
+		return modelRouteResponse{}
+	}
+	if !catalogClaimable(model) {
+		return modelRouteResponse{}
+	}
+	return modelRouteResponse{Handled: true, TargetKind: "self", Reason: agyRouteReason}
+}
+
+const agyRouteReason = "agy model served by the local Antigravity CLI"
+
+// requestModelBaseName drops CLIProxyAPI reasoning suffixes so a route decision ignores them.
+func requestModelBaseName(requested string) string {
+	model := strings.TrimSpace(requested)
 	if open := strings.LastIndex(model, "("); open > 0 && strings.HasSuffix(model, ")") {
 		model = strings.TrimSpace(model[:open])
 	}
 	for _, suffix := range []string{":low", ":medium", ":med", ":high"} {
 		if strings.HasSuffix(strings.ToLower(model), suffix) {
-			model = model[:len(model)-len(suffix)]
+			model = strings.TrimSpace(model[:len(model)-len(suffix)])
 			break
 		}
 	}
-	lower := strings.ToLower(model)
-	// antigravity/ is only claimed when the built-in Antigravity provider is not configured.
-	owned := strings.HasPrefix(lower, "agy/") ||
-		strings.HasPrefix(lower, "antigravity/") && !containsFold(req.AvailableProviders, "antigravity") ||
-		catalogHasModel(model)
-	if !owned {
-		return modelRouteResponse{}
-	}
-	return modelRouteResponse{Handled: true, TargetKind: "self", Reason: "agy model served by the local Antigravity CLI"}
+	return model
 }
 
-// catalogHasModel checks the last published catalog without running agy, since routing is on the request path.
-func catalogHasModel(model string) bool {
-	modelCatalog.Lock()
-	models := modelCatalog.models
-	modelCatalog.Unlock()
-	if len(models) == 0 {
-		models = standardBuiltinModels()
-	}
-	for _, m := range models {
-		if strings.EqualFold(m.ID, model) {
-			return true
-		}
+// nativeProviderOwnsModel reports whether a configured provider already serves this model
+// family, in which case the request must stay on the host's own routing path.
+func nativeProviderOwnsModel(model string, available []string) bool {
+	lower := strings.ToLower(strings.TrimSpace(model))
+	switch {
+	case strings.HasPrefix(lower, "claude-"):
+		return containsFold(available, "claude") || containsFold(available, "anthropic")
+	case strings.HasPrefix(lower, "gemini-"), strings.HasPrefix(lower, "gemma-"):
+		return containsFold(available, "gemini") || containsFold(available, "antigravity") ||
+			containsFold(available, "vertex") || containsFold(available, "aistudio")
+	case strings.HasPrefix(lower, "gpt-oss"), strings.HasPrefix(lower, "gpt-"):
+		return containsFold(available, "codex") || containsFold(available, "openai")
 	}
 	return false
 }
@@ -213,101 +233,6 @@ func cloneModels(in []modelInfo) []modelInfo {
 		out[i].SupportedGenerationMethods = append([]string(nil), out[i].SupportedGenerationMethods...)
 	}
 	return out
-}
-
-func parseAgyModelLines(output string) ([]modelInfo, map[string]string) {
-	byID := map[string]modelInfo{}
-	nativeByID := map[string]string{}
-
-	for _, rawLine := range strings.Split(output, "\n") {
-		line := strings.TrimSpace(rawLine)
-		line = strings.TrimSpace(strings.TrimLeft(line, "*•-"))
-		if line == "" {
-			continue
-		}
-
-		native := ""
-		label := ""
-		slug := ""
-		if parts := strings.SplitN(line, "\t", 2); len(parts) == 2 {
-			slug = strings.TrimSpace(parts[0])
-			label = strings.TrimSpace(parts[1])
-			native = slug
-		} else {
-			fields := strings.Fields(line)
-			if len(fields) >= 2 && looksLikeModelSlug(fields[0]) {
-				slug = fields[0]
-				label = strings.TrimSpace(strings.TrimPrefix(line, fields[0]))
-				native = slug
-			} else if len(fields) == 1 && looksLikeModelSlug(fields[0]) {
-				slug = fields[0]
-				label = humanizeModelName(slug)
-				native = slug
-			} else {
-				label = line
-				slug = slugifyModelLabel(label)
-				native = label
-			}
-		}
-		if slug == "" || label == "" {
-			continue
-		}
-
-		name := label
-		if name == "" || name == slug || looksLikeModelSlug(name) {
-			name = humanizeModelName(slug)
-		}
-
-		id := "agy/" + slug
-		if _, exists := byID[id]; !exists {
-			byID[id] = modelInfo{
-				ID:                         id,
-				Object:                     "model",
-				OwnedBy:                    "google-antigravity-cli",
-				DisplayName:                name,
-				Name:                       name,
-				Description:                "Discovered from the installed official agy CLI.",
-				SupportedGenerationMethods: []string{"chat"},
-				UserDefined:                true,
-			}
-			nativeByID[id] = native
-			nativeByID[name] = native
-		}
-
-		baseSlug := stripEffortSuffix(slug)
-		if baseSlug != slug {
-			baseID := "agy/" + baseSlug
-			if _, exists := byID[baseID]; !exists {
-				baseName := stripEffortLabel(name)
-				if baseName == "" || baseName == baseSlug || looksLikeModelSlug(baseName) {
-					baseName = humanizeModelName(baseSlug)
-				}
-				byID[baseID] = modelInfo{
-					ID:                         baseID,
-					Object:                     "model",
-					OwnedBy:                    "google-antigravity-cli",
-					DisplayName:                baseName,
-					Name:                       baseName,
-					Description:                "Discovered from the installed official agy CLI with configurable reasoning effort.",
-					SupportedGenerationMethods: []string{"chat"},
-					UserDefined:                true,
-				}
-				nativeByID[baseID] = baseSlug
-				nativeByID[baseName] = baseSlug
-			}
-		}
-	}
-
-	ids := make([]string, 0, len(byID))
-	for id := range byID {
-		ids = append(ids, id)
-	}
-	sort.Strings(ids)
-	models := make([]modelInfo, 0, len(ids))
-	for _, id := range ids {
-		models = append(models, byID[id])
-	}
-	return models, nativeByID
 }
 
 func looksLikeModelSlug(s string) bool {
@@ -352,10 +277,13 @@ func resolveNativeModel(model string, cfg pluginConfig) string {
 	modelCatalog.Lock()
 	defer modelCatalog.Unlock()
 
-	if native, ok := modelCatalog.nativeByID[cleanModel]; ok && native != "" {
+	// Alias keys are lowercase: the catalog only publishes bare native IDs, so legacy spellings
+	// (agy/..., antigravity/..., labels, effort-less bases) are resolution-only.
+	key := strings.ToLower(cleanModel)
+	if native, ok := modelCatalog.nativeByID[key]; ok && native != "" {
 		return native
 	}
-	if native, ok := modelCatalog.nativeByID["agy/"+cleanModel]; ok && native != "" {
+	if native, ok := modelCatalog.nativeByID["agy/"+key]; ok && native != "" {
 		return native
 	}
 	return cleanModel

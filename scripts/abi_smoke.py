@@ -124,13 +124,21 @@ def main() -> int:
         if rc != 0 or not model_response.get("ok"):
             raise RuntimeError(f"model registration failed: {model_response}")
         model_ids = [m["ID"] for m in model_response["result"]["Models"]]
-        if "agy/default" not in model_ids or "agy/mock-model-high" not in model_ids:
-            raise RuntimeError(f"expected default + discovered model: {model_ids}")
+        # Only what the CLI reported: no prefixed duplicate, no synthesized base model, no default.
+        if model_ids != ["mock-model-high"]:
+            raise RuntimeError(f"expected exactly the discovered model, got: {model_ids}")
+        for shadow in ("agy/mock-model-high", "mock-model", "agy/default", "default"):
+            if shadow in model_ids:
+                raise RuntimeError(f"compatibility entry {shadow} must not be published: {model_ids}")
 
-        # agy has no CLIProxyAPI auth record, so its models are routed straight to this executor.
+        # agy has no CLIProxyAPI auth record, so its models are routed straight to this executor,
+        # both through the published ID and through the legacy agy/ prefix.
         rc, route = call("model.route", {"RequestedModel": "agy/mock-model(high)"})
         if rc != 0 or not route["result"]["Handled"] or route["result"]["TargetKind"] != "self":
             raise RuntimeError(f"expected self route for agy model: {route}")
+        rc, route = call("model.route", {"RequestedModel": "mock-model-high"})
+        if rc != 0 or not route["result"]["Handled"] or route["result"]["TargetKind"] != "self":
+            raise RuntimeError(f"expected self route for the published model ID: {route}")
         rc, route = call("model.route", {"RequestedModel": "gpt-5.5"})
         if rc != 0 or route["result"]["Handled"]:
             raise RuntimeError(f"foreign model must not be routed: {route}")

@@ -8,53 +8,43 @@ import (
 	"testing"
 )
 
-func TestParseAgyModelLines(t *testing.T) {
-	models, mapping := parseAgyModelLines(`
+func TestParseAgyModelOutputPublishesOneEntryPerLine(t *testing.T) {
+	models := parseAgyModelOutput(`
 gemini-3.6-flash-high	Gemini 3.6 Flash (High)
 gemini-3.6-flash-medium    Gemini 3.6 Flash (Medium)
 * Claude Sonnet 4.6 (Thinking)
+gemini-3.6-flash-high
 `)
-	if len(models) != 4 {
-		t.Fatalf("len(models) = %d, want 4: %#v", len(models), models)
+	if len(models) != 3 {
+		t.Fatalf("len(models) = %d, want 3 (one per line, de-duplicated): %#v", len(models), models)
 	}
-	if mapping["agy/gemini-3.6-flash-high"] != "gemini-3.6-flash-high" {
-		t.Fatalf("unexpected mapping: %#v", mapping)
-	}
-	if mapping["agy/gemini-3.6-flash"] != "gemini-3.6-flash" {
-		t.Fatalf("base model mapping missing: %#v", mapping)
-	}
-	if mapping["agy/claude-sonnet-4-6-thinking"] != "Claude Sonnet 4.6 (Thinking)" {
-		t.Fatalf("legacy label mapping missing: %#v", mapping)
-	}
-
-	byID := map[string]modelInfo{}
+	byID := map[string]agyModel{}
 	for _, m := range models {
 		byID[m.ID] = m
 	}
-	if byID["agy/gemini-3.6-flash-high"].Name != "Gemini 3.6 Flash (High)" {
-		t.Fatalf("unexpected Name for gemini-3.6-flash-high: %q", byID["agy/gemini-3.6-flash-high"].Name)
+	if byID["gemini-3.6-flash-high"].Native != "gemini-3.6-flash-high" {
+		t.Fatalf("unexpected native for tab-separated line: %#v", byID["gemini-3.6-flash-high"])
 	}
-	if byID["agy/gemini-3.6-flash"].Name != "Gemini 3.6 Flash" {
-		t.Fatalf("unexpected Name for base gemini-3.6-flash: %q", byID["agy/gemini-3.6-flash"].Name)
+	if byID["claude-sonnet-4-6-thinking"].Native != "Claude Sonnet 4.6 (Thinking)" {
+		t.Fatalf("label-only line must keep the label as native: %#v", byID["claude-sonnet-4-6-thinking"])
+	}
+	// Base variants are aliases only, never published entries.
+	if _, exists := byID["gemini-3.6-flash"]; exists {
+		t.Fatalf("effort-less base model was parsed as a model: %#v", models)
 	}
 
-	rawModels, _ := parseAgyModelLines(`
+	raw := parseAgyModelOutput(`
 gemini-3.8-flash-high
 gpt-oss-120b-medium
 claude-sonnet-4-6
 `)
-	rawByID := map[string]modelInfo{}
-	for _, m := range rawModels {
-		rawByID[m.ID] = m
+	rawIDs := make([]string, 0, len(raw))
+	for _, m := range raw {
+		rawIDs = append(rawIDs, m.ID)
 	}
-	if rawByID["agy/gemini-3.8-flash"].Name != "Gemini 3.8 Flash" {
-		t.Fatalf("unexpected humanized Name for raw base slug: %q", rawByID["agy/gemini-3.8-flash"].Name)
-	}
-	if rawByID["agy/gpt-oss-120b"].Name != "GPT-OSS 120B" {
-		t.Fatalf("unexpected humanized Name for raw base slug: %q", rawByID["agy/gpt-oss-120b"].Name)
-	}
-	if rawByID["agy/claude-sonnet-4-6"].Name != "Claude Sonnet 4.6" {
-		t.Fatalf("unexpected humanized Name for raw claude slug: %q", rawByID["agy/claude-sonnet-4-6"].Name)
+	want := []string{"claude-sonnet-4-6", "gemini-3.8-flash-high", "gpt-oss-120b-medium"}
+	if !reflect.DeepEqual(rawIDs, want) {
+		t.Fatalf("raw parsed IDs = %#v, want %#v", rawIDs, want)
 	}
 }
 
@@ -148,7 +138,7 @@ func TestAgyArgsClaudeOmitsEffort(t *testing.T) {
 }
 
 func TestResolveExecutionOptions(t *testing.T) {
-	cfg := defaultConfig()
+	cfg := isolatedConfig(t)
 	cfg.DefaultReasoningEffort = "low"
 
 	// 1. From payload JSON
@@ -253,7 +243,7 @@ func TestResolveExecutionOptions(t *testing.T) {
 		Model:   "agy/gemini-3.8-flash",
 		Payload: []byte(`{"messages":[{"role":"user","content":"hi"}]}`),
 	}
-	opts8 := resolveExecutionOptions(req8, defaultConfig())
+	opts8 := resolveExecutionOptions(req8, isolatedConfig(t))
 	if opts8.ReasoningEffort != "high" {
 		t.Fatalf("expected fallback effort 'high' for base gemini model, got %q", opts8.ReasoningEffort)
 	}
@@ -346,6 +336,15 @@ func TestRouteModel(t *testing.T) {
 		{"antigravity/gemini-3.8-flash", []string{"antigravity"}, false},
 		{"gpt-5.5", nil, false},
 		{"agy/gemini-3.8-flash", []string{"agy"}, false},
+		// A bare "default" is too generic to intercept; only agy/default is ours.
+		{"default", nil, false},
+		// A configured native provider of the same family keeps the request.
+		{"gemini-3.8-flash-high", []string{"gemini"}, false},
+		{"claude-sonnet-4-6", []string{"claude"}, false},
+		{"claude-sonnet-4-6", []string{"anthropic"}, false},
+		{"gpt-oss-120b-medium", []string{"codex"}, false},
+		// The explicit agy/ prefix still wins over a native provider.
+		{"agy/claude-sonnet-4-6", []string{"claude"}, true},
 	}
 	for _, tc := range cases {
 		resp := routeModel(modelRouteRequest{RequestedModel: tc.model, AvailableProviders: tc.providers})

@@ -17,12 +17,19 @@ import (
 	"time"
 )
 
-// Dynamic model discovery.
+// Dynamic model discovery and catalog publication.
 //
-// `agy models` reads the login of the HOME it runs under, so discovery has to run it once per
-// signed-in account home. Running it from CLIProxyAPI's own HOME (the service user) makes agy
-// answer "Please sign in to view available models", which used to leave the catalog with only the
-// built-in Gemini entries.
+// Two things are deliberately kept apart:
+//
+//   - The published catalog: exactly the model IDs the signed-in accounts report. Nothing is
+//     synthesised on top of a successful discovery, so a client shows one entry per real model.
+//   - The alias table: legacy request names (agy/..., antigravity/..., the humanised label and
+//     the effort-less base name) still resolve to the same native model, but they are never
+//     published as separate entries.
+//
+// `agy models` reads the login of the HOME it runs under, so discovery runs once per
+// signed-in account home; running it from CLIProxyAPI's own HOME (the service user) makes agy
+// answer "Please sign in to view available models".
 const (
 	// modelsCommandTimeout bounds one `agy models` run.
 	modelsCommandTimeout = 20 * time.Second
@@ -30,15 +37,31 @@ const (
 	modelCatalogTTL = time.Minute
 )
 
+// agyModel pairs the ID published to CLIProxyAPI with the name passed to `agy --model`.
+// They differ only for older CLIs that print human-readable labels instead of slugs.
+type agyModel struct {
+	ID     string
+	Native string
+}
+
 type catalogState struct {
 	sync.Mutex
 	// key identifies the inputs (binary, workdir, account homes, account token mtimes) whose
 	// result is cached, so one account's list is never served for another.
-	key        string
-	fetchedAt  time.Time
-	models     []modelInfo
+	key       string
+	loaded    bool
+	fetchedAt time.Time
+	// models is the published catalog. It only ever contains real discovered models, plus the
+	// built-in fallback when discovery failed for every account.
+	models []modelInfo
+	// nativeByID maps lowercase request names (published IDs and legacy aliases) to the native
+	// agy model name. Aliases are resolution-only and never published.
 	nativeByID map[string]string
-	// diagnostic is the last sanitized discovery failure; it is only logged when it changes.
+	// claimable holds the lowercase bare model names the router may claim without a prefix.
+	claimable map[string]bool
+	// fallback reports whether models came from the built-in list instead of a live discovery.
+	fallback bool
+	// diagnostic is the last sanitized discovery message; it is only logged when it changes.
 	diagnostic string
 }
 
@@ -47,9 +70,12 @@ var modelCatalog = catalogState{}
 func invalidateModels() {
 	modelCatalog.Lock()
 	modelCatalog.key = ""
+	modelCatalog.loaded = false
 	modelCatalog.fetchedAt = time.Time{}
 	modelCatalog.models = nil
 	modelCatalog.nativeByID = nil
+	modelCatalog.claimable = nil
+	modelCatalog.fallback = false
 	modelCatalog.diagnostic = ""
 	modelCatalog.Unlock()
 }
@@ -172,9 +198,11 @@ func agyAuthRecords(authDir string) []agyAuthRecord {
 	return records
 }
 
-// discoverModels returns the merged model catalog: the built-in Gemini entries first so an
-// unreachable or signed-out account still keeps the previous behavior, then every model the
-// signed-in accounts report.
+// discoverModels returns the published catalog.
+//
+// The built-in list is only used when no account could be queried at all: a successful run,
+// including one that reports no models, is published as-is so the client never sees entries the
+// CLI did not report.
 func discoverModels(cfg pluginConfig) []modelInfo {
 	accounts := discoveryAccounts(cfg)
 	key := catalogKey(cfg, accounts)
@@ -182,15 +210,8 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 	modelCatalog.Lock()
 	defer modelCatalog.Unlock()
 
-	if modelCatalog.key == key && len(modelCatalog.models) > 0 && time.Since(modelCatalog.fetchedAt) < modelCatalogTTL {
+	if modelCatalog.loaded && modelCatalog.key == key && time.Since(modelCatalog.fetchedAt) < modelCatalogTTL {
 		return cloneModels(modelCatalog.models)
-	}
-
-	models := append([]modelInfo(nil), standardBuiltinModels()...)
-	nativeByID := standardNativeModelMapping()
-	seenModels := make(map[string]bool, len(models)+8)
-	for _, model := range models {
-		seenModels[strings.ToLower(model.ID)] = true
 	}
 
 	// A single-account install may have no agy auth file at all: agy then reads the login stored
@@ -202,37 +223,161 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		targets = []discoveryAccount{{Label: "process environment"}}
 	}
 
+	published := make([]modelInfo, 0, 8)
+	seen := make(map[string]bool, 8)
+	nativeByID := defaultModelAliases()
+	claimable := make(map[string]bool, 8)
 	failures := make([]string, 0, len(targets))
-	discoveredCount := 0
+	successes := 0
+
 	for _, account := range targets {
-		accountModels, accountMapping, err := fetchModelsForAccount(cfg, account.Home)
+		models, err := fetchModelsForAccount(cfg, account.Home)
 		if err != nil {
 			// Account labels are user emails; sanitize both halves before they reach a log.
 			failures = append(failures, sanitizeDiagnostic(account.Label)+": "+sanitizeDiagnostic(err.Error()))
 			continue
 		}
-		discoveredCount += len(accountModels)
-		for _, model := range accountModels {
-			key := strings.ToLower(model.ID)
-			if seenModels[key] {
+		successes++
+		for _, model := range models {
+			modelID := strings.TrimSpace(model.ID)
+			lowerID := strings.ToLower(modelID)
+			if lowerID == "" {
 				continue
 			}
-			seenModels[key] = true
-			models = append(models, model)
-		}
-		for id, native := range accountMapping {
-			if _, exists := nativeByID[id]; !exists {
-				nativeByID[id] = native
+			if !seen[lowerID] {
+				seen[lowerID] = true
+				published = append(published, publishedModelInfo(modelID))
+			}
+			registerModelAliases(nativeByID, model)
+			claimable[lowerID] = true
+			// The effort-less base name stays resolvable, and claimable for older clients,
+			// but is not published as another model.
+			if base := strings.TrimSpace(stripEffortSuffix(modelID)); base != "" && base != modelID {
+				claimable[strings.ToLower(base)] = true
 			}
 		}
 	}
 
+	fallback := successes == 0
+	if fallback {
+		// Discovery is broken: keep the previous compatibility list, and only here.
+		published = standardBuiltinModels()
+		nativeByID = builtinModelAliases()
+		claimable = builtinClaimableModels()
+	}
+
+	sort.SliceStable(published, func(i, j int) bool { return published[i].ID < published[j].ID })
+
 	modelCatalog.key = key
+	modelCatalog.loaded = true
 	modelCatalog.fetchedAt = time.Now()
-	modelCatalog.models = models
+	modelCatalog.models = published
 	modelCatalog.nativeByID = nativeByID
-	modelCatalog.diagnostic = logDiscoveryOutcome(len(accounts), legacy, discoveredCount, failures)
-	return cloneModels(models)
+	modelCatalog.claimable = claimable
+	modelCatalog.fallback = fallback
+	modelCatalog.diagnostic = logDiscoveryOutcome(len(accounts), legacy, len(published), fallback, failures)
+	return cloneModels(published)
+}
+
+// publishedModelInfo builds the catalog entry for one discovered model ID.
+func publishedModelInfo(modelID string) modelInfo {
+	name := humanizeModelName(modelID)
+	if name == "" {
+		name = modelID
+	}
+	return modelInfo{
+		ID:                         modelID,
+		Object:                     "model",
+		OwnedBy:                    "google-antigravity-cli",
+		DisplayName:                name,
+		Name:                       name,
+		Description:                "Discovered from the installed official agy CLI.",
+		SupportedGenerationMethods: []string{"chat"},
+		UserDefined:                true,
+	}
+}
+
+// registerModelAliases records every legacy spelling of a model without publishing it.
+func registerModelAliases(aliases map[string]string, model agyModel) {
+	native := strings.TrimSpace(model.Native)
+	if native == "" {
+		native = strings.TrimSpace(model.ID)
+	}
+	add := func(name, target string) {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if name == "" || strings.TrimSpace(target) == "" {
+			return
+		}
+		if _, exists := aliases[name]; exists {
+			return
+		}
+		aliases[name] = target
+	}
+
+	add(model.ID, native)
+	add("agy/"+model.ID, native)
+	add("antigravity/"+model.ID, native)
+	add(humanizeModelName(model.ID), native)
+
+	base := strings.TrimSpace(stripEffortSuffix(model.ID))
+	if base != "" && base != model.ID {
+		add(base, base)
+		add("agy/"+base, base)
+		add("antigravity/"+base, base)
+	}
+}
+
+// defaultModelAliases keeps the "default model" request paths working without publishing them.
+func defaultModelAliases() map[string]string {
+	return map[string]string{
+		"default":                         "",
+		"agy/default":                     "",
+		"antigravity/default":             "",
+		"antigravity cli (default model)": "",
+	}
+}
+
+// builtinModelAliases is the alias table that belongs to the fallback catalog.
+func builtinModelAliases() map[string]string {
+	aliases := defaultModelAliases()
+	for id, native := range standardNativeModelMapping() {
+		key := strings.ToLower(strings.TrimSpace(id))
+		if key == "" {
+			continue
+		}
+		if _, exists := aliases[key]; !exists {
+			aliases[key] = native
+		}
+	}
+	return aliases
+}
+
+// builtinClaimableModels holds the fallback IDs the router may claim. The default model stays
+// request-only because a bare "default" is too generic to intercept.
+func builtinClaimableModels() map[string]bool {
+	claimable := make(map[string]bool, 8)
+	for _, model := range standardBuiltinModels() {
+		if strings.EqualFold(model.ID, "agy/default") {
+			continue
+		}
+		claimable[strings.ToLower(model.ID)] = true
+	}
+	return claimable
+}
+
+// catalogClaimable reports whether the router may claim a bare model name. Before the first
+// discovery the built-in set is used so a request that races plugin startup still works.
+func catalogClaimable(model string) bool {
+	modelCatalog.Lock()
+	defer modelCatalog.Unlock()
+	key := strings.ToLower(strings.TrimSpace(model))
+	if key == "" {
+		return false
+	}
+	if !modelCatalog.loaded {
+		return builtinClaimableModels()[key]
+	}
+	return modelCatalog.claimable[key]
 }
 
 // catalogKey builds the cache identity. Account token mtimes are included so re-signing in an
@@ -270,31 +415,31 @@ func newModelsCommand(ctx context.Context, cfg pluginConfig) (*exec.Cmd, error) 
 }
 
 // fetchModelsForAccount runs `agy models` with the account's HOME and parses a successful run.
-func fetchModelsForAccount(cfg pluginConfig, home string) ([]modelInfo, map[string]string, error) {
+func fetchModelsForAccount(cfg pluginConfig, home string) ([]agyModel, error) {
 	accountCfg, err := withAccount(cfg, map[string]any{"home": home})
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), modelsCommandTimeout)
 	defer cancel()
 
 	cmd, err := newModelsCommand(ctx, accountCfg)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 
 	if errStart := cmd.Start(); errStart != nil {
-		return nil, nil, fmt.Errorf("could not start agy models: %w", errStart)
+		return nil, fmt.Errorf("could not start agy models: %w", errStart)
 	}
 	activeProcesses.add(cmd)
 	errWait := cmd.Wait()
 	activeProcesses.remove(cmd)
 
 	if ctxErr := ctx.Err(); ctxErr == context.DeadlineExceeded {
-		return nil, nil, fmt.Errorf("agy models timed out after %s", modelsCommandTimeout)
+		return nil, fmt.Errorf("agy models timed out after %s", modelsCommandTimeout)
 	}
 	if errWait != nil {
 		// Error output never becomes a model: only stdout of a successful run is parsed.
@@ -302,18 +447,78 @@ func fetchModelsForAccount(cfg pluginConfig, home string) ([]modelInfo, map[stri
 		if message == "" {
 			message = errWait.Error()
 		}
-		return nil, nil, fmt.Errorf("%s", message)
+		return nil, fmt.Errorf("%s", message)
 	}
 
-	models, mapping := parseAgyModelLines(stdout.String())
-	return models, mapping, nil
+	return parseAgyModelOutput(stdout.String()), nil
+}
+
+// parseAgyModelOutput reads `agy models` output into publishable model IDs plus their native
+// names. One line is one model: no base variants and no effort aliases are synthesised here.
+func parseAgyModelOutput(output string) []agyModel {
+	models := make([]agyModel, 0, 8)
+	seen := make(map[string]bool, 8)
+
+	for _, rawLine := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(rawLine)
+		line = strings.TrimSpace(strings.TrimLeft(line, "*•-"))
+		if line == "" {
+			continue
+		}
+
+		id := ""
+		native := ""
+		if parts := strings.SplitN(line, "\t", 2); len(parts) == 2 {
+			id = strings.TrimSpace(parts[0])
+			native = id
+		} else if fields := strings.Fields(line); len(fields) > 0 && looksLikeModelSlug(fields[0]) {
+			id = fields[0]
+			native = id
+		} else {
+			// Older builds print a human label only; keep the label as the native name.
+			native = line
+			id = slugifyModelLabel(line)
+		}
+
+		id = trimModelProviderPrefix(id)
+		if id == "" || native == "" {
+			continue
+		}
+		key := strings.ToLower(id)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		models = append(models, agyModel{ID: id, Native: native})
+	}
+
+	sort.SliceStable(models, func(i, j int) bool { return models[i].ID < models[j].ID })
+	return models
+}
+
+func trimModelProviderPrefix(name string) string {
+	trimmed := strings.TrimSpace(name)
+	lower := strings.ToLower(trimmed)
+	for _, prefix := range []string{"agy/", "antigravity/"} {
+		if strings.HasPrefix(lower, prefix) {
+			return strings.TrimSpace(trimmed[len(prefix):])
+		}
+	}
+	return trimmed
 }
 
 // logDiscoveryOutcome records a sanitized diagnostic line, and only when it changes.
-func logDiscoveryOutcome(accounts int, legacy bool, discovered int, failures []string) string {
+func logDiscoveryOutcome(accounts int, legacy bool, published int, fallback bool, failures []string) string {
 	if len(failures) == 0 {
+		if published == 0 {
+			const message = "agy reported no models for the signed-in accounts; publishing an empty list"
+			if modelCatalog.diagnostic != message {
+				log.Printf("[%s] %s", pluginID, message)
+			}
+			return message
+		}
 		if modelCatalog.diagnostic != "" {
-			log.Printf("[%s] model discovery recovered (%d account(s), %d discovered model(s))", pluginID, accounts, discovered)
+			log.Printf("[%s] model discovery recovered (%d account(s), %d model(s))", pluginID, accounts, published)
 		}
 		return ""
 	}
@@ -322,6 +527,9 @@ func logDiscoveryOutcome(accounts int, legacy bool, discovered int, failures []s
 		scope = "process environment"
 	}
 	message := fmt.Sprintf("%s failed model discovery: %s", scope, strings.Join(failures, "; "))
+	if fallback {
+		message += "; serving the built-in fallback list"
+	}
 	if modelCatalog.diagnostic != message {
 		log.Printf("[%s] %s", pluginID, message)
 	}
