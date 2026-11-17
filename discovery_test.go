@@ -357,22 +357,41 @@ func TestDiscoverModelsPublishesOnlyRealModels(t *testing.T) {
 
 	models := discoverModels(cfg)
 	got := modelIDs(models)
-	want := append([]string(nil), realAgyModels...)
+	want := make([]string, 0, len(realAgyModels))
+	for _, native := range realAgyModels {
+		want = append(want, "agy/"+native)
+	}
 	sort.Strings(want)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("published models = %#v, want exactly %#v", got, want)
 	}
 
-	// Nothing extra: no prefixed duplicates, no effort-less base models, no default entry.
-	for _, id := range got {
-		if strings.HasPrefix(strings.ToLower(id), "agy/") || strings.HasPrefix(strings.ToLower(id), "antigravity/") {
-			t.Fatalf("prefixed duplicate %q was published", id)
-		}
-	}
-	for _, shadow := range []string{"gemini-3.8-flash", "gpt-oss-120b", "claude-opus-4-6", "agy/default", "default"} {
+	// Nothing extra: no bare duplicate, no effort-less base model, no default entry.
+	for _, shadow := range []string{
+		"gemini-3.8-flash-high", "claude-sonnet-4-6",
+		"agy/gemini-3.8-flash", "agy/gpt-oss-120b", "agy/claude-opus-4-6",
+		"agy/default", "default", "antigravity/gemini-3.8-flash-high",
+	} {
 		if hasModelID(models, shadow) {
 			t.Fatalf("compatibility candidate %q must not be published: %#v", shadow, got)
 		}
+	}
+
+	// The display name stays free of the provider prefix and keeps the effort suffix.
+	for _, model := range models {
+		if strings.Contains(model.DisplayName, "Agy") || strings.Contains(model.Name, "Agy") {
+			t.Fatalf("display name carries a provider prefix: %#v", model)
+		}
+	}
+	byID := map[string]modelInfo{}
+	for _, model := range models {
+		byID[model.ID] = model
+	}
+	if got := byID["agy/gemini-3.8-flash-high"].DisplayName; got != "Gemini 3.8 Flash (High)" {
+		t.Fatalf("DisplayName = %q", got)
+	}
+	if got := byID["agy/claude-opus-4-6-thinking"].DisplayName; got != "Claude Opus 4.6 (Thinking)" {
+		t.Fatalf("DisplayName = %q", got)
 	}
 
 	// Aliases still resolve, they are just not listed.
@@ -470,7 +489,7 @@ func TestDiscoverModelsKeepsLegacyProcessHomeFallback(t *testing.T) {
 	cfg.BinaryPath = buildFakeAgy(t, fakeAgyAnyHomeSource)
 
 	models := discoverModels(cfg)
-	if !hasModelID(models, "legacy-model-one") {
+	if !hasModelID(models, "agy/legacy-model-one") {
 		t.Fatalf("legacy discovery fallback did not run agy: %#v", modelIDs(models))
 	}
 }
@@ -503,7 +522,7 @@ func TestDiscoveryFollowsNewModelsWithoutHardcoding(t *testing.T) {
 	writeModels(append(append([]string(nil), realAgyModels...), "gemini-3.9-flash-high"))
 	invalidateModels()
 	second := discoverModels(cfg)
-	if len(second) != len(realAgyModels)+1 || !hasModelID(second, "gemini-3.9-flash-high") {
+	if len(second) != len(realAgyModels)+1 || !hasModelID(second, "agy/gemini-3.9-flash-high") {
 		t.Fatalf("catalog did not follow the new model: %#v", modelIDs(second))
 	}
 	if !catalogClaimable("gemini-3.9-flash-high") {
@@ -529,7 +548,10 @@ func TestMultiAccountDiscoveryDedupesPublishedModels(t *testing.T) {
 
 	models := discoverModels(cfg)
 	got := modelIDs(models)
-	want := append([]string(nil), realAgyModels...)
+	want := make([]string, 0, len(realAgyModels))
+	for _, native := range realAgyModels {
+		want = append(want, "agy/"+native)
+	}
 	sort.Strings(want)
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("merged models = %#v, want the de-duplicated %#v", got, want)
@@ -554,10 +576,10 @@ func TestModelCatalogCacheIsPerAccount(t *testing.T) {
 
 	writeAuthFile(t, authDir, "antigravity-a.json", map[string]any{"type": "agy", "home": homeA, "email": "a@example.com"})
 	modelsA := discoverModels(cfg)
-	if !hasModelID(modelsA, "model-a-one") {
+	if !hasModelID(modelsA, "agy/model-a-one") {
 		t.Fatalf("account A models missing: %#v", modelIDs(modelsA))
 	}
-	if hasModelID(modelsA, "model-b-one") {
+	if hasModelID(modelsA, "agy/model-b-one") {
 		t.Fatalf("account B models leaked into account A: %#v", modelIDs(modelsA))
 	}
 
@@ -570,10 +592,10 @@ func TestModelCatalogCacheIsPerAccount(t *testing.T) {
 	// A different account set must not reuse account A's cached list.
 	writeAuthFile(t, authDir, "antigravity-b.json", map[string]any{"type": "agy", "home": homeB, "email": "b@example.com"})
 	modelsB := discoverModels(cfg)
-	if !hasModelID(modelsB, "model-b-one") {
+	if !hasModelID(modelsB, "agy/model-b-one") {
 		t.Fatalf("account B models missing after the account set changed: %#v", modelIDs(modelsB))
 	}
-	if !hasModelID(modelsB, "model-a-one") {
+	if !hasModelID(modelsB, "agy/model-a-one") {
 		t.Fatalf("merged catalog dropped account A models: %#v", modelIDs(modelsB))
 	}
 }

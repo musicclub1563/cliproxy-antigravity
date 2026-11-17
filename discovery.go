@@ -240,16 +240,18 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 		successes++
 		for _, model := range models {
 			modelID := strings.TrimSpace(model.ID)
-			lowerID := strings.ToLower(modelID)
-			if lowerID == "" {
+			if modelID == "" {
 				continue
 			}
-			if !seen[lowerID] {
-				seen[lowerID] = true
+			// Published IDs keep the provider prefix so the client groups them under "agy";
+			// only the display name drops it.
+			key := strings.ToLower(publishedModelID(modelID))
+			if !seen[key] {
+				seen[key] = true
 				published = append(published, publishedModelInfo(modelID))
 			}
 			registerModelAliases(nativeByID, model)
-			claimable[lowerID] = true
+			claimable[strings.ToLower(modelID)] = true
 			// The effort-less base name stays resolvable, and claimable for older clients,
 			// but is not published as another model.
 			if base := strings.TrimSpace(stripEffortSuffix(modelID)); base != "" && base != modelID {
@@ -279,14 +281,21 @@ func discoverModels(cfg pluginConfig) []modelInfo {
 	return cloneModels(published)
 }
 
-// publishedModelInfo builds the catalog entry for one discovered model ID.
+// publishedModelID is the ID exposed to CLIProxyAPI: the native model name under the provider
+// prefix, so clients keep grouping agy models together.
+func publishedModelID(nativeModel string) string {
+	return providerID + "/" + strings.TrimSpace(nativeModel)
+}
+
+// publishedModelInfo builds the catalog entry for one discovered model ID. The display name is
+// derived from the native name only, so it never carries a provider prefix.
 func publishedModelInfo(modelID string) modelInfo {
 	name := humanizeModelName(modelID)
 	if name == "" {
 		name = modelID
 	}
 	return modelInfo{
-		ID:                         modelID,
+		ID:                         publishedModelID(modelID),
 		Object:                     "model",
 		OwnedBy:                    "google-antigravity-cli",
 		DisplayName:                name,

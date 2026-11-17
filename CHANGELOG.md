@@ -6,9 +6,10 @@ All notable changes to this project will be documented here.
 
 ### Changed
 
-- The published catalog is now exactly what `agy models` reports for the signed-in accounts, one entry per model. The built-in Gemini list, the `agy/default` entry and the synthesized effort-less variants (`gemini-3.8-flash`, `gpt-oss-120b`, ...) are no longer mixed in after a successful discovery, so no per-account `excluded_models` rules are needed to clean the list.
-- Model IDs are published without the `agy/` prefix, because CLIProxyAPI's model list only carries `id`/`object`/`created`/`owned_by`, so clients derive the visible name from the ID. `agy/...`, `antigravity/...`, the humanized labels and the effort-less base names stay valid request aliases; they are resolution-only and never published.
-- A bare model name is only claimed when no configured native provider serves that family (claude/anthropic, gemini/antigravity/vertex, codex/openai), so an existing provider keeps its own routing. The explicit `agy/` prefix still wins.
+- Published model IDs keep the `agy/` prefix again (`agy/gemini-3.8-flash-high`, ...), so clients group the models under the agy provider. Display names stay free of that prefix and keep the real model name plus its effort or thinking suffix.
+- The published catalog is exactly what `agy models` reports for the signed-in accounts, one entry per model: no built-in Gemini fallback, no `agy/default` and no synthesized effort-less variants (`agy/gemini-3.8-flash`, `agy/gpt-oss-120b`, ...) after a successful discovery.
+- `antigravity/...`, the bare native names, the humanized labels and the effort-less base names stay valid request aliases; they are resolution-only and never published.
+- A bare model name is only claimed when no configured native provider serves that family (claude/anthropic, gemini/antigravity/vertex, codex/openai), so an existing provider keeps its own routing. The explicit `agy/` prefix always wins.
 - An empty but successful discovery publishes an empty list instead of the built-in fallback; the fallback is now used only when every account query fails.
 
 ### Fixed

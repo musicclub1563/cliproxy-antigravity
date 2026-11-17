@@ -124,10 +124,11 @@ def main() -> int:
         if rc != 0 or not model_response.get("ok"):
             raise RuntimeError(f"model registration failed: {model_response}")
         model_ids = [m["ID"] for m in model_response["result"]["Models"]]
-        # Only what the CLI reported: no prefixed duplicate, no synthesized base model, no default.
-        if model_ids != ["mock-model-high"]:
+        # Only what the CLI reported, under the provider prefix: no bare duplicate, no synthesized
+        # base model, no default entry.
+        if model_ids != ["agy/mock-model-high"]:
             raise RuntimeError(f"expected exactly the discovered model, got: {model_ids}")
-        for shadow in ("agy/mock-model-high", "mock-model", "agy/default", "default"):
+        for shadow in ("mock-model-high", "agy/mock-model", "agy/default", "default"):
             if shadow in model_ids:
                 raise RuntimeError(f"compatibility entry {shadow} must not be published: {model_ids}")
 
